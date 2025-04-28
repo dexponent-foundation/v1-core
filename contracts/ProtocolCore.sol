@@ -2,17 +2,36 @@
 pragma solidity ^0.8.24;
 
 /**
- * @title ProtocolCore
- * @notice Central contract for protocol core logic. This contract handles:
- *         - Emission of DXP tokens.
- *         - Calculation and distribution (or reversal) of deposit bonuses for liquidity providers.
- *         - Pulling and distributing yield revenue from individual farms.
- *         - Management of protocol fees and reserves.
- *         - Integration with external modules: FarmFactory for creating farms, LiquidityManager for token swaps,
- *           and a bridging adaptor for cross-chain messaging.
- * @dev This contract maintains a registry of farms (including the RootFarm) created via the protocol.
- *      Only farms created by this protocol can invoke bonus or revenue functions. Governance functions are
- *      stubbed and can be implemented later.
+ * @title  ProtocolCore (Test-net v1)
+ * @author Dexponent
+ *
+ * @notice
+ * Central registry and accounting contract for the Dexponent protocol.
+ * Responsibilities ­include
+ *
+ *  ▸ emitting & reserving DXP,
+ *  ▸ managing farms (Root Farm + user farms) and their benchmark yields,
+ *  ▸ computing / issuing / reversing LP deposit bonuses,
+ *  ▸ pulling farm revenue & splitting it among verifiers, yield-yodas and farm owner,
+ *  ▸ holding verifier stakes and exposing the canonical verifier list,
+ *  ▸ storing consensus round results (score + benchmark) supplied by an external
+ *    `Consensus` module,
+ *  ▸ supporting fast-track “time-scaling” on test-nets, and
+ *  ▸ stubbing out governance/hooks for future main-net upgrades.
+ *
+ * NOTE: Governance (fee proposals, cross-chain updates) is intentionally left
+ *       un-implemented in test-net v1; related methods are NO-OP placeholders.
+ *
+ * SECURITY MODEL
+ * ──────────────
+ *  • Only farms created via this contract (or the special Root Farm) may call
+ *    sensitive reward / bonus functions (enforced by `onlyApprovedFarm`).
+ *  • Verifier registration requires an on-chain DXP stake ≥ `minVerifierStake`.
+ *  • All external setters are `onlyOwner`, delegated to the protocol DAO on
+ *    main-net but keyed to the deployer for test-nets.
+ *
+ * All critical state is declared at the top of the file so auditors can track
+ * storage layout with the original deployment.
  */
 
 import "@openzeppelin/contracts/access/Ownable.sol";
@@ -23,119 +42,149 @@ import "./ClaimToken.sol";
 import "./interfaces/IDXPToken.sol";
 import "./vDXPToken.sol";
 import "./interfaces/IRootFarm.sol";
+import "./interfaces/IConsensus.sol";
 import "./interfaces/IFarmFactory.sol";
 import "./interfaces/ILiquidityManager.sol";
 import "./interfaces/IBridgeAdapter.sol";
 
+// local farm interface (only the fns we actually call)
+interface IFarmMinimal {
+    function pullFarmRevenue() external returns (uint256);
+
+    function verifierIncentiveSplit() external view returns (uint256);
+
+    function yieldYodaIncentiveSplit() external view returns (uint256);
+}
+
 contract ProtocolCore is Ownable, ReentrancyGuard {
-    // ============================================================================
-    // Constants and Data Structures
-    // ============================================================================
+    // ───────────────────────────────────────────────────────────
+    //                        CONSTANTS
+    // ───────────────────────────────────────────────────────────
+    uint256 public constant COOLDOWN_PERIOD = 1 days; // LP-bonus cooldown
 
-    /// @notice The cooldown period for bonus tokens returned by LPs before being recycled.
-    uint256 public constant COOLDOWN_PERIOD = 1 days;
+    // ───────────────────────────────────────────────────────────
+    //                        DATA-MODELS
+    // ───────────────────────────────────────────────────────────
 
-    /// @notice Structure storing details for each deployed farm.
+    /// Farm registry entry
     struct FarmDetails {
-        address farmAddress;  // Address of the deployed Farm contract.
-        address owner;        // The approved farm owner's address.
-        address asset;        // The underlying principal asset of the farm.
-        uint256 farmId;       // Unique farm identifier.
+        address farmAddress; // on-chain Farm contract
+        address owner; // farm-owner (EOA or multisig)
+        address asset; // principal ERC-20
+        uint256 farmId; // global farmId
     }
 
-    // ============================================================================
-    // Farm Registry and Approvals
-    // ============================================================================
-
-    // Mapping of farm contract address to its details.
-    mapping(address => FarmDetails) public farms;
-    // Reverse lookup mapping from farm ID to the corresponding farm contract address.
-    mapping(uint256 => address) public farmAddressOf;
-    // Tracks addresses approved to create and manage farms.
-    mapping(address => bool) public approvedFarmOwners;
-    IRootFarm public rootFarm;         // The special RootFarm (farmId = 0).
-    // ============================================================================
-    // Events for Farm Creation and Approval Management
-    // ============================================================================
-
-    /// @notice Emitted when a new farm is created.
-    event FarmCreated(
-        uint256 indexed farmId,
-        address indexed farmAddress,
-        address indexed owner
-    );
-    /// @notice Emitted when a farm owner is approved (or unapproved).
-    event FarmOwnerApproved(address indexed farmOwner, bool approved);
-
-    // ============================================================================
-    // Benchmark Yield Tracking
-    // ============================================================================
-
-    // Mapping of each farm's unique ID to its benchmark yield (used in bonus calculations).
-    mapping(uint256 => uint256) public farmBenchmarkYields;
-
-    // ============================================================================
-    // Deposit Bonus Records
-    // ============================================================================
-
-    /// @notice Structure that records bonus details for an LP’s deposit.
+    /// LP-bonus bookkeeping
     struct BonusRecord {
-        uint256 bonusPaid;   // Amount of bonus DXP paid.
-        bool pinned;         // Indicates if bonus is still pinned (active).
-        uint256 depositTime; // Timestamp when bonus was issued.
+        uint256 bonusPaid; // DXP sent to LP
+        bool pinned; // true = still claw-back-able
+        uint256 depositTime; // timestamp issued
     }
-    // Nested mapping: for a given farm (by farmId), record bonus information by LP address.
-    mapping(uint256 => mapping(address => BonusRecord)) public bonusRecords;
 
-    // ============================================================================
-    // Cooldown Queue for Returned Bonus Tokens
-    // ============================================================================
-
-    /// @notice Structure for tokens queued to be recycled after their cooldown period.
+    /// Returned DXP queued for recycling
     struct CooldownRecord {
-        uint256 amount;      // Amount of DXP tokens queued.
-        uint256 releaseTime; // Timestamp after which tokens can be recycled.
+        uint256 amount;
+        uint256 releaseTime;
     }
-    // Array holding all cooldown records.
+
+    /// Averaged verifier result for a consensus round
+    struct ConsensusResult {
+        uint256 score; // basis-points risk / performance score
+        uint256 benchmark; // APY % used for next period’s bonuses
+    }
+
+    /// Governance (stub)
+    struct FeeUpdateProposal {
+        uint256 id;
+        address proposer;
+        uint256 newFee; // %
+        uint256 voteEndTime;
+        uint256 forVotes;
+        uint256 againstVotes;
+        bool executed;
+    }
+
+    // ───────────────────────────────────────────────────────────
+    //                 REGISTRY - FARMS & OWNERS
+    // ───────────────────────────────────────────────────────────
+    mapping(address => FarmDetails) public farms; // farmAddr ➜ details
+    mapping(uint256 => address) public farmAddressOf; // farmId   ➜ farmAddr
+    mapping(address => bool) public approvedFarmOwners;
+    IRootFarm public rootFarm; // id 0
+
+    // ───────────────────────────────────────────────────────────
+    //                     YIELDS & CONSENSUS
+    // ───────────────────────────────────────────────────────────
+    mapping(uint256 => uint256) public farmBenchmarkYields; // farmId ➜ APY %
+    mapping(uint256 => mapping(uint256 => ConsensusResult))
+        public consensusResults; // farmId ➜ roundId ➜ result
+
+    // ───────────────────────────────────────────────────────────
+    //                  BONUS / COOLDOWN DATA
+    // ───────────────────────────────────────────────────────────
+    mapping(uint256 => mapping(address => BonusRecord)) public bonusRecords;
     CooldownRecord[] public cooldownQueue;
 
-    // ============================================================================
-    // Stakeholder Lists for Revenue Distribution
-    // ============================================================================
+    // ───────────────────────────────────────────────────────────
+    //                  VERIFIERS & YIELD-YODAS
+    // ───────────────────────────────────────────────────────────
+    mapping(uint256 => address[]) public approvedVerifiersList; // farmId ➜ verifiers
+    mapping(uint256 => address[]) public approvedYieldYodaList; // farmId ➜ yodas
+    mapping(uint256 => mapping(address => uint256)) public verifierStakes; // farmId ➜ verifier ➜ stake
+    uint256 public minVerifierStake = 100e18; // mutable parameter
 
-    // Constants and mappings for verifiers and yield yodas used in revenue distribution.
-    uint256 public constant MIN_VERIFIER_STAKE = 100e18;
-    mapping(uint256 => address[]) public approvedVerifiersList;
-    mapping(uint256 => address[]) public approvedYieldYodaList;
+    // ───────────────────────────────────────────────────────────
+    //              PROTOCOL-WIDE FINANCIAL STATE
+    // ───────────────────────────────────────────────────────────
+    uint256 internal protocolFeeRate; // % of farmOwner share
+    uint256 internal transferFeeRate;
+    uint256 internal reserveRatio; // % of fee retained in reserves
+    uint256 internal lastEmissionCall; // timestamp
+    uint256 internal protocolReserves; // DXP
+    uint256 internal emissionReserve; // DXP earmarked for emissions
+    uint256 public depositBonusRatio; // % of expected yield paid as bonus
 
-    // ============================================================================
-    // Additional Protocol Parameters and External Interfaces
-    // ============================================================================
+    // ───────────────────────────────────────────────────────────
+    //                 EXTERNAL MODULE REFERENCES
+    // ───────────────────────────────────────────────────────────
+    ILiquidityManager public liquidityManager;
+    IFarmFactory public farmFactory;
+    IBridgeAdapter public bridgeAdapter;
+    IConsensus public consensus; // pulls verifier rounds
 
-    uint256 internal protocolFeeRate;   // The current protocol fee rate (percentage).
-    uint256 internal reserveRatio;        // The percentage of fees that is kept as reserve.
-    uint256 internal lastEmissionCall;    // Timestamp when the last token emission was triggered.
-    uint256 internal protocolReserves;    // Accumulated protocol reserves (in DXP).
-    uint256 internal emissionReserve;       // DXP tokens reserved for emissions.
-    uint256 public depositBonusRatio;     // Ratio used to compute deposit bonuses.
+    // immutable tokens
+    IDXPToken public immutable dxpToken;
+    vDXPToken public immutable vdxpToken;
 
-    // External modules:
-    ILiquidityManager public liquidityManager; // For fetching TWAP prices and performing token swaps.
-    IFarmFactory public farmFactory;           // For creating farms via deterministic CREATE2.
-    IBridgeAdapter public bridgeAdapter;       // For bridging messages (not used in this code).
+    // ───────────────────────────────────────────────────────────
+    //                        TIME-SCALING
+    // ───────────────────────────────────────────────────────────
+    uint256 public timeScaleNumerator = 1; // main-net = 1
+    uint256 public timeScaleDenominator = 1;
 
-    // Immutable core tokens and the RootFarm.
-    IDXPToken public immutable dxpToken;       // The primary DXP token.
-    vDXPToken public immutable vdxpToken;        // The governance/claim token.
+    // ───────────────────────────────────────────────────────────
+    //                           EVENTS
+    // ───────────────────────────────────────────────────────────
+    event FarmCreated(
+        uint256 indexed farmId,
+        address indexed farm,
+        address indexed owner
+    );
+    event FarmOwnerApproved(address indexed farmOwner, bool approved);
 
-    // ============================================================================
-    // Events for Protocol Operations
-    // ============================================================================
+    event BenchmarkYieldUpdated(uint256 indexed farmId, uint256 newYield);
+    event ConsensusModuleUpdated(address indexed consensusAddr);
+    event ConsensusRecorded(
+        uint256 indexed farmId,
+        uint256 indexed roundId,
+        uint256 score,
+        uint256 benchmark
+    );
 
     event DepositBonusDistributed(
         uint256 indexed farmId,
         address indexed lp,
-        uint256 bonusAmount
+        uint256 bonusDXP
     );
     event DepositBonusReversed(
         uint256 indexed farmId,
@@ -147,64 +196,59 @@ contract ProtocolCore is Ownable, ReentrancyGuard {
         address indexed lp,
         uint256 bonusKept
     );
-    event EmissionTriggered(uint256 dxpBalance);
-    event ReservesDistributed(uint256 totalDistributed, uint256 farmOwnerReceived);
-    event EmissionReserveUpdated(uint256 newEmissionReserve);
+
     event CooldownTokensQueued(uint256 amount, uint256 releaseTime);
-    event CooldownTokensRecycled(uint256 totalRecycled);
+    event CooldownTokensRecycled(uint256 total);
+    event EmissionTriggered(uint256 minted);
+    event EmissionReserveUpdated(uint256 newReserve);
 
-    // ============================================================================
-    // Governance: Fee Update Proposals & Voting Structures (Stubs)
-    // ============================================================================
+    event ReservesDistributed(uint256 totalOut, uint256 toFarmOwner);
+    event TransferFeeRateUpdated(uint256 oldFeeRate, uint256 newFeeRate);
 
-    struct FeeUpdateProposal {
-        uint256 id;
-        address proposer;
-        uint256 newFee;
-        uint256 voteEndTime;
-        uint256 forVotes;
-        uint256 againstVotes;
-        bool executed;
-    }
+    event VerifierRegistered(
+        uint256 indexed farmId,
+        address indexed verifier,
+        uint256 stake
+    );
+    event VerifierUnregistered(
+        uint256 indexed farmId,
+        address indexed verifier
+    );
+    event MinVerifierStakeUpdated(uint256 oldStake, uint256 newStake);
 
-    uint256 public feeProposalCount;
-    mapping(uint256 => FeeUpdateProposal) public feeProposals;
-    mapping(uint256 => mapping(address => bool)) public feeVotesCast;
-    mapping(uint256 => mapping(address => uint256)) public feeVoteWeights;
+    event YieldYodaUpdated(
+        uint256 indexed farmId,
+        address indexed yoda,
+        bool approved
+    );
 
-    event ProtocolFeeUpdated(uint256 proposalId, uint256 newFee);
-    event YieldYodaRegistered(address indexed yoda);
-    event BenchmarkYieldUpdated(uint256 indexed farmId, uint256 newYield);
+    event TimeScaleUpdated(uint256 num, uint256 den);
 
-    // ============================================================================
-    // Modifiers
-    // ============================================================================
-
+    // ───────────────────────────────────────────────────────────
+    //                           MODIFIERS
+    // ───────────────────────────────────────────────────────────
     /**
-     * @notice Restricts access to functions so that only farms created by the protocol (or the RootFarm)
-     *         can execute them. This prevents external contracts from mimicking farm behavior and
-     *         capturing deposit bonuses or revenue.
+     * @dev Restricts caller to a whitelisted Farm created by this contract
+     *      or the special RootFarm (id 0).
      */
     modifier onlyApprovedFarm() {
         require(
-            farms[msg.sender].farmAddress == msg.sender || msg.sender == address(rootFarm),
-            "Caller is not an approved farm"
+            farms[msg.sender].farmAddress == msg.sender ||
+                msg.sender == address(rootFarm),
+            "ProtocolCore: not farm"
         );
         _;
     }
 
-    // ============================================================================
-    // Constructor
-    // ============================================================================
-
+    // ───────────────────────────────────────────────────────────
+    //                       CONSTRUCTOR
+    // ───────────────────────────────────────────────────────────
     /**
-     * @notice Initializes the protocol core by setting key parameters, deploying the governance token,
-     *         and creating the RootFarm through the FarmFactory.
-     * @param _dxpToken The address of the already deployed DXP token.
-     * @param fallbackRatio The fallback bonus ratio (e.g., 70).
-     * @param _protocolFeeRate The initial protocol fee rate (percentage).
-     * @param _reserveRatio The percentage of fees retained as reserves.
-     * @param _farmFactory The address of the FarmFactory contract.
+     * @param _dxpToken         Pre-deployed ERC-20 DXP address
+     * @param fallbackRatio     Default bonus ratio (e.g. 70 = 70 %)
+     * @param _protocolFeeRate  % fee on farm-owner slice of revenue
+     * @param _reserveRatio     % of fee kept in reserves (rest sent to RootFarm)
+     * @param _farmFactory      Factory that deploys farms & claim-tokens
      */
     constructor(
         address _dxpToken,
@@ -213,124 +257,105 @@ contract ProtocolCore is Ownable, ReentrancyGuard {
         uint256 _reserveRatio,
         address _farmFactory
     ) Ownable(msg.sender) {
-        require(_dxpToken != address(0), "DXP token=0");
-        
+        require(_dxpToken != address(0), "DXP=0");
         dxpToken = IDXPToken(_dxpToken);
         farmFactory = IFarmFactory(_farmFactory);
 
         depositBonusRatio = fallbackRatio;
         protocolFeeRate = _protocolFeeRate;
+        transferFeeRate = 50; // 0.5% default
         reserveRatio = _reserveRatio;
         lastEmissionCall = block.timestamp;
-        protocolReserves = 0;
-        emissionReserve = 0;
 
-        // Deploy vDXPToken with this protocol as the initial minter.
-        vDXPToken _vdxp = new vDXPToken("vDXP Token", "vDXP", address(this), 0);
-        vdxpToken = _vdxp;
-
+        // deploy governance/vote token (vDXP) and leave minter with this core
+        vdxpToken = new vDXPToken("vDXP Token", "vDXP", address(this), 0);
     }
 
-
-    function setApprovedFarmOwner(
-        address farmOwner,
-        bool approved
-    ) external onlyOwner {
-        approvedFarmOwners[farmOwner] = approved;
-        emit FarmOwnerApproved(farmOwner, approved);
-    }
-
-    function setApprovedVerifier(
-        uint256 farmId,
-        address verifier,
-        bool approved
-    ) external onlyOwner {
-        if (approved) {
-            approvedVerifiersList[farmId].push(verifier);
-        } else {
-            // Remove verifier from the list.
-            address[] storage verifiers = approvedVerifiersList[farmId];
-            for (uint256 i = 0; i < verifiers.length; i++) {
-                if (verifiers[i] == verifier) {
-                    verifiers[i] = verifiers[verifiers.length - 1];
-                    verifiers.pop();
-                    break;
-                }
-            }
-        }
-    }
-
-    function setApprovedYieldYoda(
-        uint256 farmId,
-        address yieldYoda,
-        bool approved
-    ) external onlyOwner {
-        if (approved) {
-            approvedYieldYodaList[farmId].push(yieldYoda);
-        } else {
-            // Remove yield yoda from the list.
-            address[] storage yieldYodas = approvedYieldYodaList[farmId];
-            for (uint256 i = 0; i < yieldYodas.length; i++) {
-                if (yieldYodas[i] == yieldYoda) {
-                    yieldYodas[i] = yieldYodas[yieldYodas.length - 1];
-                    yieldYodas.pop();
-                    break;
-                }
-            }
-        }
-    }
-    
-    // ============================================================================
-    // RootFarm Creation
-    // ============================================================================
-
-    // Create the RootFarm using the FarmFactory.
-    function createRootFarm(bytes32 salt) external onlyOwner {
-        require(address(rootFarm) == address(0), "RootFarm already created");
-        // Create the RootFarm using the FarmFactory. The RootFarm is special (farmId = 0)
-        // and uses DXP as the underlying asset with vDXP as the claim token.
-        (uint256 rootFarmId, address rootFarmAddr) = farmFactory.createRootFarm(
-            salt,
-            address(dxpToken),    // For RootFarm, the principal asset is DXP.
-            address(vdxpToken),    // Claim token is vDXP.
-            msg.sender             // The protocol owner (deployer) is initially set as the farm owner.
-        );
-        farmAddressOf[rootFarmId] = rootFarmAddr;
-        farms[rootFarmAddr] = FarmDetails({
-            farmAddress: rootFarmAddr,
-            owner: msg.sender,
-            asset: address(dxpToken),
-            farmId: rootFarmId
-        });
-        rootFarm = IRootFarm(rootFarmAddr);
-
-        // Transfer control of the vDXPToken to the RootFarm: set associated farm, minter, and transfer ownership.
-        vdxpToken.setAssociatedFarm(rootFarmAddr);
-        vdxpToken.setMinter(rootFarmAddr);
-        vdxpToken.transferOwnership(rootFarmAddr);
-
-        emit FarmCreated(rootFarmId, rootFarmAddr, msg.sender);
-    }
-
-    // ============================================================================
-    // Farm Creation via FarmFactory
-    // ============================================================================
+    // ───────────────────────────────────────────────────────────
+    //              TIME-SCALING (test-net convenience)
+    // ───────────────────────────────────────────────────────────
 
     /**
-     * @notice Allows an approved farm owner to create a new farm via the FarmFactory.
-     * @dev A new claim token is deployed for the farm and later transferred to the farm.
-     *      The caller must be approved as a farm owner.
-     * @param salt A user-supplied salt used as part of the CREATE2 derivation.
-     * @param asset The principal asset for this farm.
-     * @param maturityPeriod The minimum maturity period allowed for deposits.
-     * @param verifierIncentiveSplit Percentage of yield allocated to verifiers.
-     * @param yieldYodaIncentiveSplit Percentage of yield allocated to yield yodas.
-     * @param lpIncentiveSplit Percentage of yield allocated to liquidity providers (LPs).
-     * @param strategy The strategy contract address that deploys the farm's liquidity.
-     * @param claimName The name for the farm's claim token.
-     * @param claimSymbol The symbol for the farm's claim token.
-     * @return farmId The unique farm identifier.
-     * @return farmAddr The deployed farm contract address.
+     * @notice Convert a real-world period into an on-chain period according
+     *         to the current scale (e.g. 1 year ⇒ 12 days on Base-Sepolia).
+     */
+    function scalePeriod(
+        uint256 secondsPeriod
+    ) external view returns (uint256) {
+        return (secondsPeriod * timeScaleNumerator) / timeScaleDenominator;
+    }
+
+    /** @dev Owner-only helper to change test-net scale. */
+    function setTimeScale(uint256 num, uint256 den) external onlyOwner {
+        require(den != 0, "den=0");
+        timeScaleNumerator = num;
+        timeScaleDenominator = den;
+        emit TimeScaleUpdated(num, den);
+    }
+
+    // ───────────────────────────────────────────────────────────
+    //                FARM-OWNER REGISTRY HELPERS
+    // ───────────────────────────────────────────────────────────
+    function setApprovedFarmOwner(
+        address who,
+        bool approved
+    ) external onlyOwner {
+        approvedFarmOwners[who] = approved;
+        emit FarmOwnerApproved(who, approved);
+    }
+
+    // ───────────────────────────────────────────────────────────
+    //                       ROOT FARM
+    // ───────────────────────────────────────────────────────────
+
+    /**
+     * @notice One-shot creation of the Root Farm (farmId 0).  Uses DXP as both
+     *         principal and reward asset; receives all protocol fees.
+     */
+    /**
+     * @notice Point ProtocolCore at an already-deployed RootFarm.
+     * @param _root The RootFarm address.
+     */
+    function setRootFarm(address _root) external onlyOwner {
+        require(address(rootFarm) == address(0), "RootFarm: already set");
+        require(_root != address(0), "rootFarm address cant be zero");
+        rootFarm = IRootFarm(_root);
+        uint256 farmId = 0;
+        // 3) Record in ProtocolCore’s registry
+        farmAddressOf[farmId] = _root;
+        farms[_root] = FarmDetails({
+            farmAddress: _root,
+            owner: msg.sender,
+            asset: address(dxpToken),
+            farmId: farmId
+        });
+
+        // 4) Hand off claim-token control to the farm
+        vdxpToken.setMinter(_root);
+        vdxpToken.setAssociatedFarm(_root);
+        vdxpToken.transferOwnership(_root);
+
+        emit FarmCreated(farmId, _root, msg.sender);
+    }
+
+    // ───────────────────────────────────────────────────────────
+    //                       FARM FACTORY
+    // ───────────────────────────────────────────────────────────
+    /**
+     * @notice Create a new Farm (standard or restake) via the FarmFactory.
+     * @param salt                 User-supplied salt for deterministic CREATE2.
+     * @param asset                Principal asset for deposits.
+     * @param maturityPeriod       Deposit maturity period (seconds).
+     * @param verifierIncentiveSplit  % of yield to verifiers (0–100).
+     * @param yieldYodaIncentiveSplit % of yield to yield-yodas (0–100).
+     * @param lpIncentiveSplit        % of yield to LPs (0–100).
+     * @param strategy             Address of the strategy contract.
+     * @param claimName            Name for the farm’s claim token.
+     * @param claimSymbol          Symbol for the farm’s claim token.
+     * @param isRestaked           If true, deploys a RestakeFarm; otherwise a standard Farm.
+     * @param rootFarmAddress      Required if isRestaked=true; links back to your RootFarm.
+     * @return farmId              The auto-incremented farm identifier.
+     * @return farmAddr            The address of the newly created farm contract.
      */
     function createApprovedFarm(
         bytes32 salt,
@@ -341,47 +366,178 @@ contract ProtocolCore is Ownable, ReentrancyGuard {
         uint256 lpIncentiveSplit,
         address strategy,
         string memory claimName,
-        string memory claimSymbol
+        string memory claimSymbol,
+        bool isRestaked,
+        address rootFarmAddress
     ) external nonReentrant returns (uint256 farmId, address farmAddr) {
         require(approvedFarmOwners[msg.sender], "Not an approved farm owner");
         require(
-            verifierIncentiveSplit + yieldYodaIncentiveSplit + lpIncentiveSplit == 100,
+            verifierIncentiveSplit +
+                yieldYodaIncentiveSplit +
+                lpIncentiveSplit ==
+                100,
             "Incentive split must equal 100"
         );
-        address farmOwner = msg.sender;
 
-        // Deploy a new claim token instance for tracking LP positions (1:1 minting with deposits).
-        FarmClaimToken farmClaimToken = new FarmClaimToken(claimName, claimSymbol, address(this));
-
-        // Create the farm via the FarmFactory. The factory assigns a new, unique farm ID.
-        (farmId, farmAddr) = farmFactory.createFarm(
-            salt,
-            asset,
-            maturityPeriod,
-            verifierIncentiveSplit,
-            yieldYodaIncentiveSplit,
-            lpIncentiveSplit,
-            strategy,
-            address(farmClaimToken),
-            farmOwner
+        // 1) Deploy the claim token for this farm
+        FarmClaimToken farmClaimToken = new FarmClaimToken(
+            claimName,
+            claimSymbol,
+            address(this)
         );
 
-        // Record the new farm's details in the registry mappings.
+        // 2) Branch on restake vs. standard
+        if (isRestaked) {
+            (farmId, farmAddr) = farmFactory.createRestakeFarm(
+                salt,
+                asset,
+                maturityPeriod,
+                verifierIncentiveSplit,
+                yieldYodaIncentiveSplit,
+                lpIncentiveSplit,
+                strategy,
+                address(farmClaimToken),
+                msg.sender,
+                rootFarmAddress
+            );
+        } else {
+            (farmId, farmAddr) = farmFactory.createFarm(
+                salt,
+                asset,
+                maturityPeriod,
+                verifierIncentiveSplit,
+                yieldYodaIncentiveSplit,
+                lpIncentiveSplit,
+                strategy,
+                address(farmClaimToken),
+                msg.sender
+            );
+        }
+
+        // 3) Record in ProtocolCore’s registry
         farmAddressOf[farmId] = farmAddr;
         farms[farmAddr] = FarmDetails({
             farmAddress: farmAddr,
-            owner: farmOwner,
+            owner: msg.sender,
             asset: asset,
             farmId: farmId
         });
 
-        // Transfer control of the claim token to the farm by setting the minter and associated farm,
-        // and transferring its ownership.
+        // 4) Hand off claim-token control to the farm
         farmClaimToken.setMinter(farmAddr);
         farmClaimToken.setAssociatedFarm(farmAddr);
         farmClaimToken.transferOwnership(farmAddr);
 
-        emit FarmCreated(farmId, farmAddr, farmOwner);
+        emit FarmCreated(farmId, farmAddr, msg.sender);
+    }
+
+    // ───────────────────────────────────────────────────────────
+    //                    VERIFIER STAKING LOGIC
+    // ───────────────────────────────────────────────────────────
+    /**
+     * @notice Update the minimum DXP stake required to become a verifier.
+     *         Main-net governance can raise this; lowers spam risk on test-nets.
+     */
+    function setMinVerifierStake(uint256 stake) external onlyOwner {
+        require(stake > 0, "stake=0");
+        emit MinVerifierStakeUpdated(minVerifierStake, stake);
+        minVerifierStake = stake;
+    }
+
+    /**
+     * @notice Stake DXP and register as an approved verifier for `farmId`.
+     * @param farmId  Farm identifier
+     * @param amount  Amount of DXP to lock (must be ≥ `minVerifierStake`)
+     */
+    function registerAsVerifier(
+        uint256 farmId,
+        uint256 amount
+    ) external nonReentrant {
+        require(amount >= minVerifierStake, "stake<min");
+        require(farmAddressOf[farmId] != address(0), "bad farmId");
+
+        dxpToken.transferFrom(msg.sender, address(this), amount);
+
+        if (verifierStakes[farmId][msg.sender] == 0) {
+            approvedVerifiersList[farmId].push(msg.sender);
+        }
+        verifierStakes[farmId][msg.sender] += amount;
+        emit VerifierRegistered(farmId, msg.sender, amount);
+    }
+
+    /**
+     * @notice Withdraw part/all stake.  If balance hits zero the verifier is
+     *         automatically removed from the approved list.
+     */
+    function withdrawVerifierStake(
+        uint256 farmId,
+        uint256 amount
+    ) external nonReentrant {
+        uint256 st = verifierStakes[farmId][msg.sender];
+        require(st >= amount && amount > 0, "bad amount");
+
+        verifierStakes[farmId][msg.sender] = st - amount;
+
+        if (verifierStakes[farmId][msg.sender] == 0) {
+            address[] storage lst = approvedVerifiersList[farmId];
+            for (uint256 i; i < lst.length; i++) {
+                if (lst[i] == msg.sender) {
+                    lst[i] = lst[lst.length - 1];
+                    lst.pop();
+                    break;
+                }
+            }
+            emit VerifierUnregistered(farmId, msg.sender);
+        }
+        dxpToken.transfer(msg.sender, amount);
+    }
+
+    /// Simple views for the Consensus module / UIs
+    function isApprovedVerifier(
+        uint256 farmId,
+        address who
+    ) external view returns (bool) {
+        address[] storage lst = approvedVerifiersList[farmId];
+        for (uint256 i; i < lst.length; i++) if (lst[i] == who) return true;
+        return false;
+    }
+
+    function getApprovedVerifiers(
+        uint256 farmId
+    ) external view returns (address[] memory) {
+        return approvedVerifiersList[farmId];
+    }
+
+    function getApprovedYieldYodas(
+        uint256 farmId
+    ) external view returns (address[] memory) {
+        return approvedYieldYodaList[farmId];
+    }
+
+    // ───────────────────────────────────────────────────────────
+    //                   CONSENSUS MODULE CALLBACK
+    // ───────────────────────────────────────────────────────────
+    function setConsensusModule(address c) external onlyOwner {
+        require(c != address(0), "zero address");
+        consensus = IConsensus(c);
+        emit ConsensusModuleUpdated(c);
+    }
+
+    /**
+     * @notice Called by the active Consensus module after each round.
+     * @dev    Stores result and immediately updates `farmBenchmarkYields` so
+     *         future deposit bonuses reference the fresh value.
+     */
+    function recordConsensus(
+        uint256 farmId,
+        uint256 roundId,
+        uint256 score,
+        uint256 benchmark
+    ) external {
+        require(msg.sender == address(consensus), "!consensus");
+        consensusResults[farmId][roundId] = ConsensusResult(score, benchmark);
+        farmBenchmarkYields[farmId] = benchmark;
+        emit ConsensusRecorded(farmId, roundId, score, benchmark);
     }
 
     // ============================================================================
@@ -420,7 +576,7 @@ contract ProtocolCore is Ownable, ReentrancyGuard {
         uint256 minted = balanceAfter - balanceBefore;
         emissionReserve += minted;
         protocolReserves += minted;
-        emit EmissionTriggered(dxpToken.balanceOf(address(dxpToken)));
+        emit EmissionTriggered(minted);
         emit EmissionReserveUpdated(emissionReserve);
     }
 
@@ -466,7 +622,10 @@ contract ProtocolCore is Ownable, ReentrancyGuard {
         require(expectedYield > 0, "No yield => no bonus");
 
         // Ensure the LiquidityManager is set to obtain a TWAP price for conversion.
-        require(address(liquidityManager) != address(0), "No LiquidityManager set");
+        require(
+            address(liquidityManager) != address(0),
+            "No LiquidityManager set"
+        );
         uint256 dxpPriceScaled = liquidityManager.getTwapPrice(
             address(dxpToken),
             farmDetails.asset,
@@ -560,7 +719,9 @@ contract ProtocolCore is Ownable, ReentrancyGuard {
      */
     function _queueCooldown(uint256 amount) internal {
         uint256 release = block.timestamp + COOLDOWN_PERIOD;
-        cooldownQueue.push(CooldownRecord({ amount: amount, releaseTime: release }));
+        cooldownQueue.push(
+            CooldownRecord({amount: amount, releaseTime: release})
+        );
         emit CooldownTokensQueued(amount, release);
     }
 
@@ -604,7 +765,7 @@ contract ProtocolCore is Ownable, ReentrancyGuard {
         require(farmAddress != address(0), "Invalid farmId");
         FarmDetails memory farmDetail = farms[farmAddress];
 
-        uint256 revenueDXP = Farm(farmDetail.farmAddress).pullFarmRevenue();
+        uint256 revenueDXP = IFarm(farmDetail.farmAddress).pullFarmRevenue();
         require(revenueDXP > 0, "No revenue to pull");
 
         _distributeRevenue(farmId, revenueDXP);
@@ -622,8 +783,10 @@ contract ProtocolCore is Ownable, ReentrancyGuard {
         address farmAddress = farmAddressOf[farmId];
         FarmDetails memory farmDetail = farms[farmAddress];
 
-        uint256 verifierSplit = Farm(farmDetail.farmAddress).verifierIncentiveSplit();
-        uint256 yieldYodaSplit = Farm(farmDetail.farmAddress).yieldYodaIncentiveSplit();
+        uint256 verifierSplit = Farm(farmDetail.farmAddress)
+            .verifierIncentiveSplit();
+        uint256 yieldYodaSplit = Farm(farmDetail.farmAddress)
+            .yieldYodaIncentiveSplit();
         uint256 farmOwnerSplit = 100 - verifierSplit - yieldYodaSplit;
 
         uint256 verifierAmount = (netRevenue * verifierSplit) / 100;
@@ -675,60 +838,6 @@ contract ProtocolCore is Ownable, ReentrancyGuard {
     }
 
     // ============================================================================
-    // Governance: Fee Update Proposals & Voting (Stubs for Future Implementation)
-    // ============================================================================
-
-    /**
-     * @notice Proposes a new protocol fee rate.
-     * @param newFee New fee rate (must be ≤ 100).
-     * @param votingPeriod Voting duration in seconds.
-     * @return proposalId The unique identifier for this fee proposal.
-     */
-    function proposeProtocolFeeUpdate(
-        uint256 newFee,
-        uint256 votingPeriod
-    ) external nonReentrant returns (uint256 proposalId) {
-        require(newFee <= 100, "Fee>100%");
-        require(vdxpToken.isCooledDown(msg.sender), "Not cooled down for voting");
-        // Implementation omitted for brevity.
-    }
-
-    /**
-     * @notice Casts a vote on a protocol fee update proposal.
-     * @param proposalId The proposal identifier.
-     * @param support True for supporting the proposal, false otherwise.
-     */
-    function voteOnFeeUpdate(
-        uint256 proposalId,
-        bool support
-    ) external nonReentrant {
-        
-    }
-
-    /**
-     * @notice Executes a fee update proposal if it passes.
-     * @param proposalId The identifier of the proposal.
-     */
-    function executeFeeUpdate(uint256 proposalId) external nonReentrant {
-        
-    }
-
-    /**
-     * @notice Sends a cross-chain governance update via the bridging adaptor.
-     * @param destChainId Destination chain ID.
-     * @param targetContract Target contract address on the destination chain.
-     * @param data Encoded governance update message.
-     */
-    function sendGovernanceUpdate(
-        uint256 destChainId,
-        address targetContract,
-        bytes calldata data
-    ) external payable onlyOwner {
-        require(address(bridgeAdapter) != address(0), "No bridge adapter set");
-        // implementation pending.
-    }
-
-    // ============================================================================
     // External Setters and Public Getters
     // ============================================================================
 
@@ -765,6 +874,28 @@ contract ProtocolCore is Ownable, ReentrancyGuard {
         protocolFeeRate = newFee;
     }
 
+
+        // ─── CLAIM TOKEN FEE ──────────────────────────────────────────────────────
+    /**
+     * @notice Update the basis-points fee charged on claimToken transfers.
+     * @param _newFeeRate Fee in bp (max 2000 = 20%).
+     */
+    function setTransferFeeRate(uint256 _newFeeRate) external onlyOwner {
+        require(_newFeeRate <= 2000, "fee too high");
+        emit TransferFeeRateUpdated(transferFeeRate, _newFeeRate);
+        transferFeeRate = _newFeeRate;
+    }
+
+    // ─── GOVERNANCE STUBS ─────────────────────────────────────────────────────
+    function proposeProtocolFeeUpdate(uint256, uint256)
+        external nonReentrant returns (uint256)
+    { revert("unimplemented"); }
+    function voteOnFeeUpdate(uint256, bool) external nonReentrant { revert("unimplemented"); }
+    function executeFeeUpdate(uint256)  external nonReentrant         { revert("unimplemented"); }
+    function sendGovernanceUpdate(
+        uint256, address, bytes calldata
+    ) external payable onlyOwner { revert("unimplemented"); }
+
     /**
      * @notice Returns the current protocol fee rate.
      */
@@ -772,6 +903,9 @@ contract ProtocolCore is Ownable, ReentrancyGuard {
         return protocolFeeRate;
     }
 
+    function getTransferFeeRate() external view returns (uint256) {
+        return transferFeeRate;
+    }
     /**
      * @notice Returns the current DXP reserves held by the protocol.
      */

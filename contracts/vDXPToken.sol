@@ -91,7 +91,7 @@ contract vDXPToken is BaseClaimToken {
     {
         require(recipient != address(0), "vDXP: transfer to zero address");
         address sender = _msgSender();
-        uint256 feeRate = transferFeeRate; // Inherited from BaseClaimToken.
+        uint256 feeRate = protocolCore.getTransferFeeRate(); // Inherited from BaseClaimToken.
 
         if (feeRate > 0) {
             uint256 fee = (amount * feeRate) / 10000;
@@ -131,7 +131,7 @@ contract vDXPToken is BaseClaimToken {
         require(currentAllowance >= amount, "vDXP: transfer amount exceeds allowance");
         _approve(sender, _msgSender(), currentAllowance - amount);
 
-        uint256 feeRate = transferFeeRate;
+        uint256 feeRate = protocolCore.getTransferFeeRate(); // Inherited from BaseClaimToken.
         if (feeRate > 0) {
             uint256 fee = (amount * feeRate) / 10000;
             uint256 net = amount - fee;
