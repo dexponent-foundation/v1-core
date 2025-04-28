@@ -508,6 +508,26 @@ contract ProtocolCore is Ownable, ReentrancyGuard {
         return approvedVerifiersList[farmId];
     }
 
+    /** @dev owner-only list manager for Yield-Yodas (new) */
+    function setApprovedYieldYoda(
+        uint256 id,
+        address yoda,
+        bool approved
+    ) external onlyOwner {
+        address[] storage arr = approvedYieldYodaList[id];
+        if (approved) {
+            arr.push(yoda);
+        } else {
+            for (uint256 i; i < arr.length; i++)
+                if (arr[i] == yoda) {
+                    arr[i] = arr[arr.length - 1];
+                    arr.pop();
+                    break;
+                }
+        }
+        emit YieldYodaUpdated(id, yoda, approved);
+    }
+
     function getApprovedYieldYodas(
         uint256 farmId
     ) external view returns (address[] memory) {
@@ -874,8 +894,7 @@ contract ProtocolCore is Ownable, ReentrancyGuard {
         protocolFeeRate = newFee;
     }
 
-
-        // ─── CLAIM TOKEN FEE ──────────────────────────────────────────────────────
+    // ─── CLAIM TOKEN FEE ──────────────────────────────────────────────────────
     /**
      * @notice Update the basis-points fee charged on claimToken transfers.
      * @param _newFeeRate Fee in bp (max 2000 = 20%).
@@ -887,14 +906,28 @@ contract ProtocolCore is Ownable, ReentrancyGuard {
     }
 
     // ─── GOVERNANCE STUBS ─────────────────────────────────────────────────────
-    function proposeProtocolFeeUpdate(uint256, uint256)
-        external nonReentrant returns (uint256)
-    { revert("unimplemented"); }
-    function voteOnFeeUpdate(uint256, bool) external nonReentrant { revert("unimplemented"); }
-    function executeFeeUpdate(uint256)  external nonReentrant         { revert("unimplemented"); }
+    function proposeProtocolFeeUpdate(
+        uint256,
+        uint256
+    ) external nonReentrant returns (uint256) {
+        revert("unimplemented");
+    }
+
+    function voteOnFeeUpdate(uint256, bool) external nonReentrant {
+        revert("unimplemented");
+    }
+
+    function executeFeeUpdate(uint256) external nonReentrant {
+        revert("unimplemented");
+    }
+
     function sendGovernanceUpdate(
-        uint256, address, bytes calldata
-    ) external payable onlyOwner { revert("unimplemented"); }
+        uint256,
+        address,
+        bytes calldata
+    ) external payable onlyOwner {
+        revert("unimplemented");
+    }
 
     /**
      * @notice Returns the current protocol fee rate.
@@ -906,6 +939,7 @@ contract ProtocolCore is Ownable, ReentrancyGuard {
     function getTransferFeeRate() external view returns (uint256) {
         return transferFeeRate;
     }
+
     /**
      * @notice Returns the current DXP reserves held by the protocol.
      */
