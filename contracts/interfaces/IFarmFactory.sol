@@ -3,22 +3,23 @@ pragma solidity ^0.8.24;
 
 /**
  * @title IFarmFactory
- * @notice Interface for the FarmFactory contract.
+ * @notice Interface for FarmFactory, allowing ProtocolCore (owner) to deploy
+ *         standard farms and restake farms via CREATE2-based constructors.
  */
 interface IFarmFactory {
     /**
-     * @notice Creates a new Farm contract using an internal farm ID counter.
-     * @param salt A user-supplied salt to influence CREATE2 deployment.
-     * @param asset The principal asset address for the new farm.
-     * @param maturityPeriod The maturity period (in seconds) for deposits in the farm.
-     * @param verifierIncentiveSplit The percentage allocated to verifiers.
-     * @param yieldYodaIncentiveSplit The percentage allocated to yield yodas.
-     * @param lpIncentiveSplit The percentage allocated to liquidity providers.
-     * @param strategy The address of the strategy contract for liquidity deployment.
-     * @param claimToken The claim token contract address (e.g. vDXPToken) for the farm.
-     * @param farmOwner The user who is recorded as the farm owner.
-     * @return farmId The unique identifier for the newly created farm.
-     * @return farmAddress The deployed Farm contract address.
+     * @notice Deploys a new standard Farm contract using CREATE2.
+     * @param salt                User-supplied salt for deterministic deployment.
+     * @param asset               The ERC-20 asset to be used as principal in the farm.
+     * @param maturityPeriod      Deposit maturity period (in seconds) before full withdrawal.
+     * @param verifierIncentiveSplit Percentage of yield allocated to verifiers (0-100).
+     * @param yieldYodaIncentiveSplit Percentage of yield allocated to yield yodas (0-100).
+     * @param lpIncentiveSplit      Percentage of yield allocated to liquidity providers (0-100).
+     * @param strategy            The strategy contract address to manage deployed assets.
+     * @param claimToken          The associated claim token contract address for this farm.
+     * @param farmOwner           The address that will be set as the farm owner.
+     * @return farmId             The unique identifier assigned to the deployed farm.
+     * @return farmAddress        The address of the newly created Farm contract.
      */
     function createFarm(
         bytes32 salt,
@@ -33,19 +34,30 @@ interface IFarmFactory {
     ) external returns (uint256 farmId, address farmAddress);
 
     /**
-     * @notice Creates the special RootFarm contract.
-     * The RootFarm is always created with id 0. This function can be called only if no RootFarm exists.
-     * @param salt A user-supplied salt for CREATE2.
-     * @param dxpToken The DXP token address (to be used as the asset).
-     * @param vdxpToken The vDXP token address (to be used as the claim token).
-     * @param farmOwner The address that will be recorded as the owner of the RootFarm.
-     * @return farmId The unique identifier for the RootFarm (always 0).
-     * @return farmAddress The deployed RootFarm contract address.
+     * @notice Deploys a new RestakeFarm contract using CREATE2.
+     * @param salt                User-supplied salt for deterministic deployment.
+     * @param asset               The ERC-20 asset to be used as principal in the restake farm.
+     * @param maturityPeriod      Restake deposit maturity period (in seconds).
+     * @param verifierIncentiveSplit Percentage of yield allocated to verifiers (0-100).
+     * @param yieldYodaIncentiveSplit Percentage of yield allocated to yield yodas (0-100).
+     * @param lpIncentiveSplit      Percentage of yield allocated to liquidity providers (0-100).
+     * @param strategy            The strategy contract address to manage restaked assets.
+     * @param claimToken          The associated claim token contract address for this farm.
+     * @param farmOwner           The address that will be set as the restake farm owner.
+     * @param rootFarmAddress     The address of the RootFarm to which this restake farm is linked.
+     * @return farmId             The unique identifier assigned to the deployed restake farm.
+     * @return farmAddress        The address of the newly created RestakeFarm contract.
      */
-    function createRootFarm(
+    function createRestakeFarm(
         bytes32 salt,
-        address dxpToken,
-        address vdxpToken,
-        address farmOwner
+        address asset,
+        uint256 maturityPeriod,
+        uint256 verifierIncentiveSplit,
+        uint256 yieldYodaIncentiveSplit,
+        uint256 lpIncentiveSplit,
+        address strategy,
+        address claimToken,
+        address farmOwner,
+        address rootFarmAddress
     ) external returns (uint256 farmId, address farmAddress);
 }
