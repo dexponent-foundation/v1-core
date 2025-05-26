@@ -167,7 +167,7 @@ contract ProtocolCore is Ownable, ReentrancyGuard {
     // ───────────────────────────────────────────────────────────
     event FarmCreated(
         uint256 indexed farmId,
-        address indexed farm,
+        address indexed farmAddress,
         address indexed owner
     );
     event FarmOwnerApproved(address indexed farmOwner, bool approved);

@@ -11,6 +11,10 @@ import "./interfaces/IProtocolCore.sol";
  *         to the central ProtocolCore.
  */
 contract Consensus is Ownable {
+    
+    /// @notice Fixed-point scale for scores: 1.0 == 1e18.
+    uint256 public constant MAX_SCORE = 1e18;
+    
     /// @notice Reference to the central ProtocolCore registry
     IProtocolCore public protocolCore;
 
@@ -110,8 +114,11 @@ contract Consensus is Ownable {
     function submit(uint256 farmId, uint256 score, uint256 benchmark) external {
         Round storage rnd = rounds[farmId];
         require(rnd.id > 0 && !rnd.finalized, "No active round");
+        // Score must be in [0,1], fixed-point 18-decimals.
+        require(score <= MAX_SCORE, "Consensus: score>1.0");
+
         require(
-            score <= 10000 && benchmark <= 10000,
+            benchmark <= 10000,
             "Values >100% not allowed"
         );
 
@@ -155,20 +162,20 @@ contract Consensus is Ownable {
             }
         }
 
-        require(count >= minQuorum, "Quorum not met");
-
-        uint256 consensusScore = totalScore / count;
-        uint256 consensusBenchmark = totalBenchmark / count;
-        rnd.finalized = true;
-
-        // Record results in ProtocolCore
-        protocolCore.recordConsensus(
-            farmId,
-            rnd.id,
-            consensusScore,
-            consensusBenchmark
-        );
-
-        emit RoundFinalized(farmId, rnd.id, consensusScore, consensusBenchmark);
+        if (count >= minQuorum) {
+            uint256 consensusScore = totalScore / count;
+            uint256 consensusBenchmark = totalBenchmark / count;
+            rnd.finalized = true;
+            protocolCore.recordConsensus(
+                farmId,
+                rnd.id,
+                consensusScore,
+                consensusBenchmark
+            );
+            emit RoundFinalized(farmId, rnd.id, consensusScore, consensusBenchmark);
+        } else {
+            rnd.finalized = true;
+            emit RoundFinalized(farmId, rnd.id, 0, 0);
+        }
     }
 }
