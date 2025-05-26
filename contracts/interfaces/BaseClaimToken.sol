@@ -3,9 +3,11 @@ pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "./IFarm.sol";
 
-import "./IProtocolCore.sol";
+/// @dev Minimal interface for Farm to update principal reserve.
+interface IFarm {
+    function updatePrincipalReserve(uint256 fee) external;
+}
 
 
 /**
@@ -26,17 +28,18 @@ abstract contract BaseClaimToken is ERC20, Ownable {
     /// @notice Address allowed to mint/burn this token (e.g., a Farm or protocol).
     address public minter;
 
+    /// @notice Transfer fee rate in basis points (e.g., 200 means 2%).
+    uint256 public transferFeeRate;
+
     /// @notice Address of the associated Farm contract.
     /// This should be set by the Farm once deployed.
     address public associatedFarm;
-
-
-    IProtocolCore public protocolCore;
 
     // -------------------------------------------------------------------------
     // Events
     // -------------------------------------------------------------------------
     event MinterUpdated(address indexed oldMinter, address indexed newMinter);
+    event TransferFeeRateUpdated(uint256 oldFeeRate, uint256 newFeeRate);
     event AssociatedFarmUpdated(address indexed oldFarm, address indexed newFarm);
 
     // -------------------------------------------------------------------------
@@ -49,7 +52,7 @@ abstract contract BaseClaimToken is ERC20, Ownable {
     ) ERC20(_name, _symbol) {
         require(_minter != address(0), "BaseClaimToken: invalid minter");
         minter = _minter;
-        protocolCore = IProtocolCore(_minter); // Protocol mints the claim token
+        transferFeeRate = 0; // Default: no fee.
     }
 
     // -------------------------------------------------------------------------
@@ -65,6 +68,17 @@ abstract contract BaseClaimToken is ERC20, Ownable {
         minter = _minter;
     }
 
+    /**
+     * @notice Updates the transfer fee rate in basis points.
+     *         For example, 200 corresponds to a 2% fee.
+     *         The fee rate is capped at 2000 BPs (20%).
+     * @param _newFeeRate The new fee rate.
+     */
+    function setTransferFeeRate(uint256 _newFeeRate) external onlyOwner {
+        require(_newFeeRate <= 2000, "BaseClaimToken: fee rate too high");
+        emit TransferFeeRateUpdated(transferFeeRate, _newFeeRate);
+        transferFeeRate = _newFeeRate;
+    }
 
     /**
      * @notice Sets the associated Farm address.
@@ -120,8 +134,6 @@ abstract contract BaseClaimToken is ERC20, Ownable {
         address sender = _msgSender();
         require(recipient != address(0), "BaseClaimToken: transfer to zero address");
 
-        uint256 transferFeeRate = protocolCore.getTransferFeeRate();
-
         if (transferFeeRate > 0) {
             uint256 fee = (amount * transferFeeRate) / 10000;
             uint256 net = amount - fee;
@@ -130,7 +142,7 @@ abstract contract BaseClaimToken is ERC20, Ownable {
             if (associatedFarm != address(0)) {
                 // Interface IFarm should include updatePrincipalReserve(uint256 fee)
                 // Here we assume the call succeeds; in production you might add error handling.
-                IFarm(associatedFarm).onClaimTransfer(sender, recipient, amount);
+                IFarm(associatedFarm).updatePrincipalReserve(fee);
             }
             // Transfer the net amount to the recipient.
             super._transfer(sender, recipient, net);
@@ -154,14 +166,12 @@ abstract contract BaseClaimToken is ERC20, Ownable {
         require(currentAllowance >= amount, "BaseClaimToken: transfer amount exceeds allowance");
         _approve(sender, _msgSender(), currentAllowance - amount);
 
-        uint256 transferFeeRate = protocolCore.getTransferFeeRate();
-
         if (transferFeeRate > 0) {
             uint256 fee = (amount * transferFeeRate) / 10000;
             uint256 net = amount - fee;
 
             if (associatedFarm != address(0)) {
-                IFarm(associatedFarm).onClaimTransfer(sender, recipient, amount);
+                IFarm(associatedFarm).updatePrincipalReserve(fee);
             }
             super._transfer(sender, recipient, net);
         } else {
