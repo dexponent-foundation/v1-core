@@ -276,7 +276,9 @@ contract Farm is Ownable, ReentrancyGuard {
             require(msg.value == amount, "Farm: native asset mismatch");
         }
 
-        require(maturity >= minimumMaturityPeriod, "Farm: maturity too short");
+        uint256 minPeriod = protocolMaster.scalePeriod(minimumMaturityPeriod);
+
+        require(maturity >= block.timestamp + minPeriod, "Farm: maturity too short");
 
         totalLiquidity += amount;
 
@@ -635,17 +637,28 @@ contract Farm is Ownable, ReentrancyGuard {
     // ======================================================
     // Update Principal Reserve Called by Claim Token
     // ======================================================
-    /**
-     * @notice Called by the associated claim token when a transfer fee is deducted.
-     *         Updates the principal reserve by adding the fee amount.
-     * @param fee The fee amount.
-     */
-    function updatePrincipalReserve(uint256 fee) external {
+
+    function onClaimTransfer(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) external {
         require(
             msg.sender == address(claimToken),
             "Farm: caller is not associated claim token"
         );
-        principalReserve += fee;
+        // This function is called when a transfer fee is deducted.
+        // The fee amount is added to the principal reserve.
+        uint256 fee = protocolMaster.getTransferFeeRate();
+        require(fee > 0, "Farm: no transfer fee");
+        uint256 feeAmount = (amount * fee) / 10000; // Assuming fee is in basis points (0-10000).
+        require(feeAmount > 0, "Farm: fee amount is zero");
+        uint256 netAmount = amount - feeAmount; // Net amount after fee deduction.
+        // Update the principal reserve with the fee amount.
+        principalReserve += feeAmount;
+        positions[recipient].principal += netAmount; // Update recipient's principal.
+        positions[sender].principal -= netAmount; // Update sender's principal.
+        // Emit an event for the principal reserve update.
         emit PrincipalReserveUpdated(fee, principalReserve);
     }
 }

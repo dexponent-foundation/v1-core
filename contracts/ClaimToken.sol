@@ -18,8 +18,7 @@ contract FarmClaimToken is BaseClaimToken {
         string memory _symbol,
         address _minter
     ) BaseClaimToken(_name, _symbol, _minter) Ownable(msg.sender) {
-        // Optionally set an initial transfer fee, or keep as 0.
-        // transferFeeRate = 50; // e.g. 0.5%
+        // Initialize the claim token with the minter and other parameters.
     }
 
     // Add farm-specific logic if needed
